@@ -8,16 +8,19 @@
 #include <Adafruit_GFX.h>    // Core graphics library
 #include <Adafruit_ST7735.h> // Hardware-specific library for ST7735
 #include "HX711.h"           // scale adc
-#include "beer_gfx.h"
 #include <TonePlayer.h>
+#include "AiEsp32RotaryEncoder.h"
+#include "ESP32_WS2812_Lib.h"
 //#include "driver/ledc.h"
 //#include "hal/ledc_types.h"
-#include "AiEsp32RotaryEncoder.h"
+#include <esp_now.h>
+#include <WiFi.h>
+#include "beer_gfx.h"
 
 //#define DEBUG
 
 // DISPLAY (Aliexpress 1.77" TFT)
-// https://github.com/adafruit/Adafruit-ST7735-Library/blob/master/examples/graphicstest/graphicstest.ino
+// https://github.com/adafruit/Adafruit-ST7735-Library
 #define TFT_CS0     -1 // manual
 #define TFT_CS1     16
 #define TFT_CS2     17
@@ -34,64 +37,88 @@ Adafruit_ST7735 tfts[5] = { {TFT_CS0, TFT_DC, TFT_RST}, // fake tft, used to pri
                             {TFT_CS4, TFT_DC, TFT_RST} };
 
 // SCALE (Aliexpress 10KG Load Cell with green HX711 board)
-// https://github.com/RobTillaart/HX711/blob/master/examples/HX_kitchen_scale/HX_kitchen_scale.ino
+// https://github.com/RobTillaart/HX711
 #define SCALE_MISO  27//12
 #define SCALE_CLK   26//14
 // MISO, SCK using hardware HSPI? -- hardware spi not working as pin 14 can't be high on boot
 HX711 scale;
 
-// ROTARY ENCODER/BUTTON
-// AliExpress EC11 15mm plum handle, https://de.aliexpress.com/item/1005005983134515.html
+// ROTARY ENCODER/BUTTON (AliExpress EC11 15mm plum handle, https://de.aliexpress.com/item/1005005983134515.html)
+// https://github.com/igorantolic/ai-esp32-rotary-encoder
 #define ROTARY_A GPIO_NUM_2
 #define ROTARY_B GPIO_NUM_4
 #define ROTARY_T GPIO_NUM_15
 // library seems unstable (v1.7) but can handle pulldown encoder with interrupt, high active button not working, handled manually
 AiEsp32RotaryEncoder rotary = AiEsp32RotaryEncoder(ROTARY_A, ROTARY_B, -1, -1, 4, true);
 
-// PIEZO SPEAKER
+// PIEZO SPEAKER (random part)
+// https://github.com/ZulNs/TonePlayer
 #define PIEZO_P 14
 // library seems hardcoded to ledc timer0 channel0, which requires some workaround for display pwm and light sleep mode
 TonePlayer piezo(PIEZO_P);
 
+// WS2812 LED RING, 24 LEDs
+// https://github.com/Zhentao-Lin/ESP32_WS2812_Lib
+#define LED_DI 12
+// how much current does this thing need in standby? additional pin to switch 5V line with a mosfet?
+ESP32_WS2812 leds = ESP32_WS2812(24, LED_DI, 0);
+
 // GLOBALS
-// scale scale
+// scale measure
 float raw[5] = {0};     //g  weight raw value buffer
 uint8_t pos = 0;        //g  weight raw value buffer position
 float avg = 0;          //g  weight       fir/iir filtered
 float avg_l = 0;        //g  weight, last
 float davg = 0;         //g  weight difference
 float tar = 0;          //g  tara value   fir/iir filtered below 2g
-uint8_t disp_tar = 0;   //   diplayed tare changing, boolean
-uint8_t disp_fix = 0;   //   diplayed fix, boolean
-uint8_t sleep_en = 1;   //   allow sleeping in main loop
+
+// gui / hardware
+float disp_avg = 0;     //g  weight, remote or local avg
+float disp_avg_l = 0;   //g  weight, remote or local avg
+float disp_stable = 0;  //g  weight, remote or local avg
+uint8_t disp_remote = 0;//   display remote weight
+uint8_t disp_tar = 0;   //   display tare changing, boolean
+uint8_t disp_fix = 0;   //   display fix, boolean
 uint32_t tlast;         //ms loop timing
+uint8_t sleep_en = 1;   //   allow sleeping in main loop
 uint8_t btn_hist = 0;   //   last button states f. debouncing
 uint8_t menu = 0;       //   which menu we are in, 0=none
+uint8_t bri_tft = 7;    //   0..7
+uint8_t bri_led = 5;    //   0..7
+uint8_t volume = 7;     //   0..7 -> 0..255 ()
+
+// esp now
+uint32_t peer_start = 0; //ms start time of peering 
+uint8_t peer_last = 0;  //ms last time
+uint8_t peer_found = 0; //   we found a second scale
+float avg_rec = 0;      //g  weight, received from other scale
+float stable_rec = 0;   //   ratio of stable time to STABLE_t_1, received
+uint8_t greeting[]  = "Bier mit mir?!";
+uint8_t intro[]     = "BS1.0";
+uint8_t broadcast[] = {0xff, 0xff, 0xff, 0xff, 0xff, 0xff};
 
 // text
 #define TXT_L 10
-#define TXT_T 50
+#define TXT_T 52
 uint16_t FG[5] = {ST77XX_BLACK, ST77XX_BLACK, ST77XX_WHITE, ST77XX_WHITE, ST77XX_BLACK};
 uint16_t BG[5] = {ST77XX_WHITE, ST77XX_GREEN, ST77XX_RED,   ST77XX_BLUE,  ST77XX_YELLOW};
 
 // tara sign
 #define TAR_L 159 - 6*3 - 4 //137 to 154
-#define TAR_T 50            
+#define TAR_T 52            
 
 // get stable value
 #define STABLE_L   5    
-#define STABLE_T   42 
+#define STABLE_T   45 
 #define STABLE_W   150
 #define STABLE_H   3 
-#define STABLE_t_0 700    //ms start displaying bar
+#define STABLE_t_0 200    //ms start displaying bar 700
 #define STABLE_t_1 2200   //ms consider value stable
 uint32_t stable_ms = 0;   //ms time without change
 int16_t  stable_avg;      //g  stable value, full integers
-uint32_t stable_a_ms = 0; //ms time without change
-int16_t  stable_a_avg;    //g  stable value, +0.5
-uint32_t stable_b_ms = 0; //ms time without change
-int16_t  stable_b_avg;    //g  stable value, +0.5
 uint8_t  stable_x_l = 0;  //px last drawn x value
+uint8_t  stable_xled_l = 0;//px last drawn x value on leds
+float    stable = 0;      //   ratio of stable time to STABLE_t_1
 
 // scale display
 #define BGSCALE ST77XX_BLACK
@@ -105,7 +132,7 @@ uint8_t  stable_x_l = 0;  //px last drawn x value
 uint8_t gfx_h[100] = {0};  //px scale line heights, indexed in rounded g
 
 // beer display
-#define BEER_T  2
+#define BEER_T  4
 #define BEER_L  10
 uint16_t BEER_m_0[3]  = {16,  380, 345};  //g  mass of empty beer
 uint16_t BEER_m_1[3]  = {516, 880, 845};  //g  mass of full beer
@@ -129,18 +156,25 @@ uint8_t bubble_y[BUBBLE_N] = {0}; //px y positions ob bubbles
 #define DINIT   F("displays initialized")
 #define SINIT   F("scale initialized")
 #define GINIT   F("graphics initialized")
-uint16_t brightness[8] = {1, 3, 8, 20, 60, 180, 400, 1023};
+uint16_t BR10[] = {1, 3, 8, 20, 60, 180, 400, 1023};
+uint8_t  BR8[]  = {0, 1, 2, 5,  15, 45,  100, 255};
 
-const PROGMEM uint8_t SONG_START[] = { NC6, 256-2, ND6, 256-2, NE6,  256-2, NF5,   256-2, 0, 0, 64, 0};
-const PROGMEM uint8_t SONG_FIX[] = { NC6, 256-2, 0, 0, 64, 0};
-const PROGMEM uint8_t SONG_420[] = {
-  NFIS6, 256-2, NFIS6, 256-2, ND6,  256-2, NB5,   256-2, REST,  256-2, NB5,   256-2, REST,  256-2, NE6,   256-2,
-  REST,  256-2, NE6,   256-2, REST, 256-2, NE6,   256-2, NGIS6, 256-2, NGIS6, 256-2, NA6,   256-2, NB6,   256-2,
-  NA6,   256-2, NA6,   256-2, NA6,  256-2, NE6,   256-2, REST,  256-2, ND6,   256-2, REST,  256-2, NFIS6, 256-2,
-  REST,  256-2, NFIS6, 256-2, REST, 256-2, NFIS6, 256-2, NE6,   256-2, NE6,   256-2, NFIS6, 256-2, NE6,   256-2,
-  REPEAT, 0, 0, 64, 0
+const PROGMEM uint8_t SONG_START[] = { NC6, 256-2, ND6, 256-2, NE6,  256-2, NF5,   256-2};
+const PROGMEM uint8_t SONG_FIX[]   = { NC6, 256-4 };
+const PROGMEM uint8_t SONG_420[]   = {
+  NGIS5, 256-32, NGIS5, 256-32, NGIS5, 256-32, NGIS5, 256-32, NGIS5, 256-16, NGIS5, 256-32,
+  NGIS5, 256-8,  NGIS5, 256-32, NGIS5, 256-32, NGIS5, 256-32, NG5, 256-16, NF5, 0, 3, 8, 
+  NGIS5, 256-32, NGIS5, 256-32, NGIS5, 256-32, NAIS5, 256-32, NAIS5, 256-16, NAIS5, 256-32, 
+  NAIS5, 256-32, NAIS5, 256-32, NAIS5, 256-32, NAIS5, 256-8,  NG5, 256-32, NG5, 256-32, //50
+  NG5, 256-32, NF5, 256-16, NDIS5, 0, 3, 8, NAIS5, 256-8, NC6, 256-32, NC6, 256-32, 
+  NC6, 256-32, NC6, 256-16, NAIS5, 256-16, NGIS5, 256-16, NGIS5, 256-16, NGIS5, 256-32,  
+  NDIS6, 256-32, NDIS6, 256-32, NC6, 256-32, NDIS6, 256-32, NCIS6, 256-4, NF6, 0, 3, 32,//90 
+  NF6, 256-32, NDIS6, 256-32, NDIS6, 256-32, NCIS6, 256-16, NC6, 0, 3, 32, NC6, 256-32, 
+  NCIS6, 256-32, NCIS6, 256-32, NGIS5, 265-16, NAIS5, 0, 3, 32, NGIS5, 256-32,  NAIS5, 256-32, 
+  NAIS5, 256-32, NG5, 256-32, NAIS5, 256-16, NGIS5, 0, 3, 16, NDIS6, 256-32, NF6, 256-32,
+  NDIS6, 256-16, NCIS6, 256-16, NC6, 256-32, NC6, 256-32, NAIS5, 256-16, REPEAT, 0, 0, 142, 0
 };
-
+//RTTTL: x:b=50,o=5,d=32:p,g#,g#,g#,g#,16g#,g#,8g#,g#,g#,g#,16g,4f.,g#,g#,g#,a#,16a#,a#,a#,a#,a#,8a#,g,g,g,16f,4d#.,8a#,c6,c6,c6,16c6,16a#,16g#,16g#,g#,d#6,d#6,c6,d#6,4c#6,16f.6,f6,d#6,d#6,16c#6,16c.6,c6,c#6,c#6,16g#,16a#.,g#,a#,a#,g,16a#,8g#.,d#6,f6,16d#6,16c#6,c6,c6,16a#,
 
 // CODE
 void IRAM_ATTR readEncoderISR(){
@@ -153,12 +187,17 @@ void setup() {
   Serial.begin(115200);
   //#endif
 
+  // LEDs
+  leds.begin();
+  leds.setLedColor(0, 0, 255, 0);
+
   // BACKLIGHTS
   // timer 0 used for sound, attach backlight pwm to channels using other timers
   for(uint8_t i=1; i<5; i++){
     pinMode(TFT_BL[i], OUTPUT);
     ledcAttachChannel(TFT_BL[i], 100, 10, 9+i); // 10,11 -> T1 12,13 -> T2
     ledcWrite(TFT_BL[i], 0);
+    leds.setLedColor(i, 0, 255, 0);
   }
   // set timers 1,2 to use low speed rc clock which runs during light sleep
   ledc_timer_config_t ledc_timer = {.speed_mode = LEDC_LOW_SPEED_MODE, .duty_resolution = LEDC_TIMER_10_BIT,
@@ -166,13 +205,15 @@ void setup() {
   ledc_timer_config(&ledc_timer);
   ledc_timer.timer_num = LEDC_TIMER_2;
   ledc_timer_config(&ledc_timer);
-
+  leds.setLedColor(5, 0, 255, 0);
+  
   // INIT PIEZO
   //pinMode(PIEZO_P, OUTPUT);
   piezo.setOnToneCallback(onTone);
   piezo.setOnMuteCallback(onMute);
-  piezo.setSong((uint8_t*)SONG_START, sizeof(SONG_START), 169);
-  piezo.play();  // Begins playback a song.
+  piezo.setSong((uint8_t*)SONG_START, sizeof(SONG_START), 175);
+  piezo.play();
+  leds.setLedColor(6, 0, 255, 0);
 
   // INIT DISPLAYS
   pinMode(TFT_CS1, OUTPUT);
@@ -180,21 +221,23 @@ void setup() {
   pinMode(TFT_CS3, OUTPUT);
   pinMode(TFT_CS4, OUTPUT);
   tft_cs_all(HIGH);
-  
   for(uint8_t i=0; i<5; i++){
     tfts[i].setSPISpeed(10000000);
     tfts[i].initR(INITR_BLACKTAB);
     tfts[i].setRotation(1);
     tfts[i].setTextWrap(false);
     if(i>0){
-      ledcWrite(TFT_BL[i], 1023);
       tfts[i].setTextColor(FG[i], BG[i]);
-      tfts[i].fillScreen(BG[i]);
+      //tfts[i].fillScreen(BG[i]);
       tfts[i].setTextSize(3);
     }else{
       tfts[i].setTextColor(FG[i]);
       tfts[i].setTextSize(1);
     }
+    leds.setLedColorData(7+i*3, 0, 255, 0);
+    leds.setLedColorData(8+i*3, 0, 255, 0);
+    leds.setLedColorData(9+i*3, 0, 255, 0);
+    leds.show();
   }
   
   tft_print_all(DINIT, 2, 2);
@@ -204,7 +247,7 @@ void setup() {
 
   // INIT SCALE ADC, MEASURE INITIAL TARE
   scale.begin(SCALE_MISO, SCALE_CLK);
-  scale.set_scale(220.56);
+  scale.set_scale(222.22); // //n:222.22 //b:220.56
   tar = scale.get_units(10); // bad first value?
   avg = tar = scale.get_units(10);
 
@@ -212,38 +255,48 @@ void setup() {
   #ifdef DEBUG
     Serial.println(SINIT);
   #endif
+  leds.setLedColor(23, 0, 255, 0);
 
   // INIT ROTARY
   rotary.begin();
   rotary.setup(readEncoderISR);
-  //rotary.setAcceleration(0);
-  //rotary.correctionOffset=2;
+  rotary.setAcceleration(0);
+  rotary.correctionOffset=0;
   pinMode(ROTARY_T, INPUT_PULLDOWN);
-  
+
+  for(uint8_t i=0; i<24; i++)
+    leds.setLedColorData(i, 0, 0, 0);
+  leds.show();
+
   // INIT GRAPHICS
   gfx_init();
-  draw_main();
+
+  init_main();
+  
+  for(uint8_t i=1; i<5; i++)
+        ledcWrite(TFT_BL[i], BR10[bri_tft]);
   
   #ifdef DEBUG
     Serial.println(GINIT);
   #endif
 
   //gpio_dump_all_io_configuration(stdout, SOC_GPIO_VALID_GPIO_MASK);
+  connect();
 }
 
-void draw_main() {
+void init_main() {
   menu = 0;
   rotary.setBoundaries(0, 7, false);
-  rotary.setEncoderValue(7);
+  rotary.setEncoderValue(bri_tft);
 
   for(uint8_t i = 1; i < 5; i++)
     tfts[i].fillScreen(BG[i]);
 
   // draw scale background
   tft_cs_all(LOW);
-  tfts[0].fillRect(0, 128-49, 160, 49, BGSCALE);      
-  tfts[0].drawFastHLine(0, 128-50, 160, FGSCALE);
-  tfts[0].drawFastVLine(SCALE_M, 128-49, 20, ST77XX_RED);
+  tfts[0].fillRect(0, 128-48, 160, 48, BGSCALE);      
+  tfts[0].drawFastHLine(0, 128-49, 160, FGSCALE);
+  tfts[0].drawFastVLine(SCALE_M, 128-48, 19, ST77XX_RED);
   tfts[0].drawFastVLine(SCALE_M, 128-20, 20, ST77XX_RED);
   tft_cs_all(HIGH);
 
@@ -261,7 +314,7 @@ void draw_main() {
 
   uint16_t* c = (uint16_t*)BEER_LOGO_IMG;
   tft_cs_all(LOW);
-  for(uint8_t y = 0; y < 42; y++)
+  for(uint8_t y = 2; y < 44; y++)
     for(uint8_t x = 160-70; x < 160-70+64; x++){
       if(*c != 0xF81F) //magenta
         tfts[0].writePixel(x, y, *c);
@@ -269,20 +322,8 @@ void draw_main() {
     }
   tfts[0].fillRect(6, 20, 160-70-6, 2, 0x047a);
   tft_cs_all(HIGH);
-}
-
-void draw_menu1(){
-  menu = 1;
-
-  tft_cs_all(LOW);
-  tfts[0].fillScreen(BG[0]);
-  tft_print_all_it("> back", 10, 10, 2);
-  tft_print_all_it("  test1", 10, 10+16, 2);
-  tft_print_all_it("  test2", 10, 10+32, 2);
-  tft_cs_all(LOW);
-  
-  rotary.setBoundaries(0, 2, true);
-  rotary.setEncoderValue(0);
+  if(beer_disp != 255)
+    beer_init();
 }
 
 void loop() {
@@ -290,48 +331,48 @@ void loop() {
   // measure and average
   measure();
 
-  // new text
+  // esp now
+  if(((millis() - peer_start) < 10000) || peer_found)
+    send_greeting();
+  else if(peer_start > 0)
+    disconnect();
+  if(peer_found && !disp_tar)
+    send_weight();
+
+  // draw main - menu only drawn on input
   if(menu == 0){
-      
-    char txt[19];
-    if(avg <= -1000)
-      sprintf(txt, " low", avg);
-    else{
-      if(avg > 4000)
-        sprintf(txt, "high", avg);
-      else{
-          sprintf(txt, "%6.1f", avg);
-      }
-    }
-    if((millis()-stable_ms) < STABLE_t_1 && round(10*avg) != round(10*avg_l))
-      tft_print_all_it(txt, TXT_L, TXT_T, 3);
-    
-    // draw graphics
-    stable_draw();
+    // new text
+    txt_draw();
+    // graphics
+    stable_draw(); // determines FIX
     gfx_draw();
     beer_draw();
   }
-  if(menu == 1){
-    // only redraw on input
-  }
 
-  // button, music stuff
+  // input, music stuff
   piezo.loop();
   if (rotary.encoderChanged()) rotary_cb(rotary.readEncoder());
   button_loop();
 
   // frame rate limiter, use sleep to save some battery if possible
   if(33 - min(33lu, millis() - tlast) > 0){
-    if(!sleep_en)
+    if(1)//!sleep_en)
       delay(33 - min(33lu, millis() - tlast));
     else{
       gpio_wakeup_enable(ROTARY_A, GPIO_INTR_HIGH_LEVEL);
       gpio_wakeup_enable(ROTARY_B, GPIO_INTR_HIGH_LEVEL);
       gpio_wakeup_enable(ROTARY_T, GPIO_INTR_HIGH_LEVEL);
       esp_sleep_enable_gpio_wakeup();
-      //esp_deep_sleep(1000*(millis() - tlast)); kills all data outside rtc ram
+      if(peer_found || peer_start){
+        esp_now_deinit();
+        WiFi.mode(WIFI_OFF);
+      }
       esp_sleep_enable_timer_wakeup(1000*(33-min(33lu, millis() - tlast)));
+      //Serial.printf("dt2: %d\n", millis() - tlast);
       esp_light_sleep_start(); 
+      if(peer_found || peer_start) {
+        connect();
+      }
     }
   }
   uint32_t tnow = millis();
@@ -363,7 +404,7 @@ void measure(){
   // iir ema with increased sample weight for large differences
   davg = 0.9 * davg + 0.1 * (val - avg);  //g change
   float dnoise = 0.5;                     //g expected sample standard deviation in davg
-  float alpha = 0.008 + 0.15 * ((fabs(davg)/dnoise))/((fabs(davg)/dnoise)+1);
+  float alpha = 0.009 + 0.180 * ((fabs(davg)/dnoise))/((fabs(davg)/dnoise)+1);
   
   //float delta = millis()-stable_ms;
   //float alpha = 0.01 + 0.15 * max(0.0f, min(1.0f, (float)STABLE_t_0 * STABLE_t_0 / delta / delta ));
@@ -372,55 +413,90 @@ void measure(){
   avg = (1-alpha) * avg + alpha * val;
 
   // iir tare below 2g to account for beer sweat on scale
-  if(fabs(avg) < 2.0 && fabs(val) < 2.0){
-    tar = tar + 0.004 * val;
+  if(fabs(avg) < 10.0 && fabs(val) < 10.0){
+    tar = tar + 0.01 * val;
     if(disp_tar == 0){
       tft_print_all_it("TAR", TAR_L, TAR_T, 1);
+      for(uint8_t i=0; i<24; i++)
+        leds.setLedColorData(i, 0, 0, BR8[bri_led] / 32); // blue
+      leds.show();
+      send_weight();
       disp_tar = 1;
     }
   }
   else{
     if(disp_tar == 1){
       tft_print_all_it("   ", TAR_L, TAR_T, 1);
+      for(uint8_t i=0; i<24; i++)
+        leds.setLedColorData(i, BR8[bri_led] / 2, BR8[bri_led] / 2, 0); // yellow
+      leds.show();
       disp_tar = 0;
     }
   }
 
   // reset stable time if value changed
-  #if 1
   // based on rate of change
   uint16_t sta = (uint16_t)floor(round(avg*10)/10);
-  if((fabs(avg) < 2) || fabs(davg) > 0.5){
+  if((fabs(avg) < 10.0) || fabs(davg) > 0.5){
     stable_ms = millis();
     stable_avg = sta;
   }
-  #endif
-
-  #if 0
-  // based on difference from stable value
-  uint16_t sta = (uint16_t)floor(round(avg*10)/10);
-  if((fabs(avg) < 2) || (stable_a_avg - sta) != 0){
-    stable_a_ms = millis();
-    stable_a_avg = sta;
-    stable_ms = stable_b_ms;
-    stable_avg = stable_b_avg;
-  }
-  uint16_t stb = (uint16_t)round(round(avg*10)/10);
-  if((fabs(avg) < 2) || (stable_b_avg - stb) != 0){
-    stable_b_ms = millis();
-    stable_b_avg = sta;
-    stable_ms = stable_a_ms;
-    stable_avg = stable_a_avg;
-  }
-  #endif
+  stable = float(millis() - stable_ms) / STABLE_t_1;
 }
 
-// draws the line and FIX text ----------
+// draws the weight, local or remote
+void txt_draw(){
+  char txt[19];
+
+  disp_avg = avg;
+  disp_stable = stable;
+  if(peer_found){
+    if(avg_rec > 10.0 && disp_tar){
+      if(disp_remote != 1){
+        tft_print_all_it(" ", 4, TAR_T+8, 1);
+        tft_print_all_it("R", 4, TAR_T+16, 1);
+        disp_remote = 1;
+        for(uint8_t i=0; i<24; i++)
+        leds.setLedColorData(i, BR8[bri_led] / 2, BR8[bri_led] / 2, 0); // yellow
+        leds.show();
+      }
+      else
+        // otherwise remote avg not drawn
+        disp_stable = stable_rec; 
+      disp_avg = avg_rec;
+    }
+    else{
+      if(disp_remote != 0){
+        tft_print_all_it("L", 4, TAR_T+8, 1);
+        tft_print_all_it(" ", 4, TAR_T+16, 1);
+        disp_remote = 0;
+        disp_tar = 0; //reprints TAR
+      }
+    }
+  }
+
+  if(round(10*disp_avg) == round(10*disp_avg_l)) 
+    return;
+
+  if(disp_avg <= -1000)
+    sprintf(txt, " low", disp_avg);
+  else{
+    if(disp_avg > 4000)
+      sprintf(txt, "high", disp_avg);
+    else{
+        sprintf(txt, "%6.1f", disp_avg);
+    }
+  }
+
+  if(disp_stable < 1)
+    tft_print_all_it(txt, TXT_L, TXT_T, 3);
+  disp_avg_l = disp_avg;
+}
+
+// draws the stable line,  leds and FIX/420 text ----------
 void stable_draw(){
-  //if(stable_avg < 2) return;
-  float t = millis() - stable_ms;
-  uint8_t x = max(0.0f, min((float)STABLE_W, STABLE_W * (t - STABLE_t_0) / (STABLE_t_1 - STABLE_t_0)));
   // bar
+  uint8_t x = max(0.0f, min((float)STABLE_W, STABLE_W * disp_stable));
   for(uint8_t i=1; i<5; i++){
     if(x > stable_x_l){
       tfts[i].fillRect(STABLE_L + stable_x_l, STABLE_T, x - stable_x_l, STABLE_H, FG[i]);
@@ -430,17 +506,35 @@ void stable_draw(){
     }
   }
 
+  // same for leds
+  uint8_t xled = max(0.0f, min((float)25, 25 * disp_stable));
+  if(xled > stable_xled_l){
+    for(uint8_t i=stable_xled_l; i<xled; i++){
+        //leds.setLedColorData(i, int((5-i)/5.0*255), int(i/5.0*255), 0);
+        leds.setLedColorData(i, BR8[bri_led] / 2, 0, BR8[bri_led] / 2); // purple
+        }
+     leds.show();
+  }
+  else if (x < stable_x_l){ // reset
+    for(uint8_t i=0; i<24; i++)
+        leds.setLedColorData(i, BR8[bri_led] / 2, BR8[bri_led] / 2, 0); // yellow
+    leds.show();
+  }
+
   // logos
-  if(x==STABLE_W){
+  if(disp_stable >=1 ){
     if(disp_fix == 0){
       tft_print_all_it("FIX", TAR_L, TAR_T, 1);
+      for(uint8_t i=0; i<24; i++)
+        leds.setLedColorData(i, 0, BR8[bri_led], 0); // green
+          leds.show();
       disp_fix = 1;
       piezo.setSong((uint8_t*)SONG_FIX, sizeof(SONG_FIX), 169);
       if(stable_avg == 420){
         tft_print_all_it("420", TAR_L, TAR_T+8, 1);
-        piezo.setSong((uint8_t*)SONG_420, sizeof(SONG_420), 169);
+        piezo.setSong((uint8_t*)SONG_420, sizeof(SONG_420), 12);
       }
-      piezo.play();  // Begins playback a song.     
+      piezo.play();
     }
   }
   else{ 
@@ -451,6 +545,7 @@ void stable_draw(){
     }
   }
   stable_x_l = x;
+  stable_xled_l = xled;
 }
 
 // beer draw functions ----------
@@ -491,7 +586,7 @@ void beer_draw(){
 
   // if no beer type specified, either recognize if possible and init or leave
   if(beer_disp == 255){
-    if((millis() - stable_ms) < STABLE_t_1)
+    if(!disp_fix)
       return;
     if(abs(stable_avg - BEER_m_1[0]) < tol){
       beer_disp = 0; // can
@@ -693,40 +788,221 @@ void tft_cs_all(uint8_t val){
   digitalWrite(TFT_CS4, val);
 }
 
+// disable sleep on sound playback
 void onTone(uint16_t f){ sleep_en = 0; }
 void onMute(){ sleep_en = 1; }
 
+// inputs, menu
 void rotary_cb(long v) {
   #ifdef DEBUG
     Serial.printf("rotate: %i\n", v);
   #endif
-  if(menu == 0){
-  //if(v == 7) sleep_en = 1; else sleep_en = 0;
-    ledcWrite(TFT_BL[1], brightness[v]);
-    ledcWrite(TFT_BL[2], brightness[v]);
-    ledcWrite(TFT_BL[3], brightness[v]);
-    ledcWrite(TFT_BL[4], brightness[v]);
+  draw_menu(v, 0);
+}
+
+void button_loop() {
+  uint8_t btn = digitalRead(ROTARY_T);
+  btn_hist = (btn_hist << 1) | btn;
+  if((btn_hist & 0b00011111) == 0b0001111){
+    #ifdef DEBUG
+      Serial.printf("click \n");
+    #endif
+    uint8_t pos = rotary.readEncoder();
+    draw_menu(pos, 1);
   }
-  if(menu != 0){
-    for(uint8_t i=0; i<3; i++){
+}
+
+void draw_menu(uint8_t v, uint8_t click){
+  if(click){ // button pressed, new menu
+    switch(menu){
+      case 0:
+        // 0 -> 1: initialize menu
+        for(uint8_t i=1; i<5; i++)
+          tfts[i].fillScreen(BG[i]);
+        tft_print_all_it(" back...", 16, 10, 2);
+        tft_print_all_it(" link...", 16, 10+16, 2);
+        tft_print_all_it(" led bri.", 16, 10+32, 2);
+        tft_print_all_it(" tft bri.", 16, 10+48, 2);
+        tft_print_all_it(" snd vol.", 16, 10+64, 2);
+        menu = 1;
+        rotary.setBoundaries(0, 4, true);
+        rotary.setEncoderValue(0);
+        v = 0;
+        break;
+      case 1:
+        // 1 -> x: select
+        if(v == 0){
+          init_main(); // includes menu=0, encoder stuff
+          return;
+        }
+        if(v == 1){
+          connect();
+          init_main();
+          return;
+        }
+        if(v == 2){
+          menu = 12;
+          tft_print_all_it("=", 10, 10+2*16, 2);
+          rotary.setBoundaries(0, 7, false);
+          rotary.setEncoderValue(bri_led);
+        }
+        if(v == 3){
+          menu = 13;
+          tft_print_all_it("=", 10, 10+3*16, 2);
+          rotary.setBoundaries(0, 7, false);
+          rotary.setEncoderValue(bri_tft);
+        }
+        if(v == 4){
+          menu = 14;
+          tft_print_all_it("=", 10, 10+4*16, 2);
+          rotary.setBoundaries(0, 7, false);
+          rotary.setEncoderValue(volume);
+        }
+        break;
+      case 12:
+        menu = 1;
+        rotary.setEncoderValue(2);
+        rotary.setBoundaries(0, 4, true);
+        break;
+      case 13:
+        menu = 1;
+        rotary.setEncoderValue(3);
+        rotary.setBoundaries(0, 4, true);
+        break;
+      case 14:
+        menu = 1;
+        rotary.setEncoderValue(4);
+        rotary.setBoundaries(0, 4, true);
+        break;
+    }
+    v = rotary.readEncoder();
+  }
+
+  // encoder input
+  //if(menu == 0){
+  //  if(bri_led == bri_tft) // change both if same
+  //    bri_led = v;
+  //  bri_tft = v;
+  //  ledcWrite(TFT_BL[1], BR10[v]);
+  //  ledcWrite(TFT_BL[2], BR10[v]);
+  //  ledcWrite(TFT_BL[3], BR10[v]);
+  //  ledcWrite(TFT_BL[4], BR10[v]);
+  //}
+
+  if(menu == 12 || menu == 0){
+    bri_led = v;
+    for(uint8_t i=0; i<24; i++)
+      leds.setLedColorData(i, 0, BR8[bri_led], 0);
+    leds.show();
+  }
+  if(menu == 13){
+    bri_tft = v;
+    ledcWrite(TFT_BL[1], BR10[v]);
+    ledcWrite(TFT_BL[2], BR10[v]);
+    ledcWrite(TFT_BL[3], BR10[v]);
+    ledcWrite(TFT_BL[4], BR10[v]); 
+  }
+  if(menu == 14){
+    volume = v;
+    piezo.setVolume((uint8_t)((v * 255ul) / 7)); 
+    piezo.setSong((uint8_t*)SONG_FIX, sizeof(SONG_FIX), 169);
+    piezo.play();
+  }
+
+  // draw
+  if(menu == 1){
+    for(uint8_t i=0; i<5; i++){
       if(i == v) 
         tft_print_all_it(">", 10, 10+i*16, 2);
       else 
         tft_print_all_it(" ", 10, 10+i*16, 2);
     }
   }
+  if(menu == 1 || menu == 12){
+    char txt[2];
+    sprintf(txt, "%d", bri_led);
+    tft_print_all_it(txt, 130, 42, 2);  
+  }
+  if(menu == 1 || menu == 13){
+    char txt[2];
+    sprintf(txt, "%d", bri_tft);
+    tft_print_all_it(txt, 130, 58, 2);  
+  }
+  if(menu == 1 || menu == 14){
+    char txt[2];
+    sprintf(txt, "%d", volume);
+    tft_print_all_it(txt, 130, 74, 2);  
+  }
 }
 
-void button_loop() {
-  uint8_t btn = digitalRead(ROTARY_T);
-  btn_hist = (btn_hist << 1) | btn;
-    if((btn_hist & 0b00011111) == 0b0001111){
-      //Serial.printf("click \n");
-      if(menu == 0) draw_menu1();
-      else if(menu == 1) {
-        uint8_t pos = rotary.readEncoder();
-        if(pos == 0) draw_main();
-        else Serial.printf("menu %d", pos);
-      }
+
+// esp-net
+void data_recv(const uint8_t * mac, const uint8_t *incomingData, int len){
+
+  Serial.printf("received %d byte\n", len);
+  if(len == sizeof(intro)+sizeof(avg)+sizeof(stable_rec)){
+    if(!strncmp((char*)intro, (char*)incomingData, sizeof(intro))){
+      memcpy(&avg_rec, incomingData+sizeof(intro), sizeof(avg_rec));
+      memcpy(&stable_rec, incomingData+sizeof(intro)+sizeof(avg_rec), sizeof(stable_rec));
     }
+    return;
+  }
+  if(len == sizeof(greeting))
+    if(!strncmp((char*)greeting, (char*)incomingData, sizeof(greeting))){
+      peer_found = 1;
+      #ifdef DEBUG
+        Serial.println("found peer!!");
+      #endif
+    }
+}
+
+void send_weight(){
+  uint8_t buffer[sizeof(intro) + sizeof(avg) + sizeof(stable)];
+  memcpy(buffer, intro, sizeof(intro));
+  memcpy(buffer + sizeof(intro), &avg, sizeof(avg));
+  memcpy(buffer + sizeof(intro) + sizeof(avg), &stable, sizeof(stable));
+  esp_err_t result = esp_now_send(broadcast, buffer, sizeof(buffer));
+}
+
+void send_greeting(){
+  //Serial.println("greet!!");
+  if(millis() - peer_last < 300)
+    return;
+  peer_last = millis();
+  esp_err_t result = esp_now_send(broadcast, greeting, sizeof(greeting));
+  if(millis() / 500 % 2 || peer_found)
+    tft_print_all_it("C", 4, TAR_T, 1);
+  else
+    tft_print_all_it(" ", 4, TAR_T, 1);
+}
+
+void connect() {
+  if(peer_start == 0){
+    Serial.println("connect!!");
+    peer_start = millis();
+    peer_found = 0;
+    disp_remote = 2;
+  }
+
+  WiFi.mode(WIFI_STA);
+  //WiFi.disconnect();
+  WiFi.STA.begin();
+
+  esp_now_init();
+  esp_now_register_recv_cb(esp_now_recv_cb_t(data_recv));
+
+  esp_now_peer_info_t peer = {};
+  memset(peer.peer_addr, 0xff, 6);
+  peer.channel = 0;  
+  peer.encrypt = false;
+  esp_now_add_peer(&peer);
+}
+
+void disconnect(){
+  Serial.println("disconnecting");
+  tft_print_all_it(" ", 4, TAR_T, 1);
+  peer_start = 0;
+  esp_now_deinit();
+  //WiFi.disconnect();
+  WiFi.mode(WIFI_OFF);
 }

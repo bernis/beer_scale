@@ -3,6 +3,12 @@
 // Beer Scale v1.0
 // Bernhard Stampfer 2024
 //
+// todo: fix/remove volume 
+//       change 420 song      
+//       add cal menu
+//       animation         done
+//       better text       somewhat
+//       timeout           done
 ////////////////////////////////////////
 
 #include <Adafruit_GFX.h>    // Core graphics library
@@ -79,8 +85,9 @@ float disp_stable = 0;  //g  weight, remote or local avg
 uint8_t disp_remote = 0;//   display remote weight
 uint8_t disp_tar = 0;   //   display tare changing, boolean
 uint8_t disp_fix = 0;   //   display fix, boolean
+int8_t disp_shift = 0;  //   shift animation
 uint32_t tlast;         //ms loop timing
-uint8_t sleep_en = 1;   //   allow sleeping in main loop
+uint8_t sleep_lock = 0; //   disable light sleep, lsb..sound, lsb+1..wifi
 uint8_t btn_hist = 0;   //   last button states f. debouncing
 uint8_t menu = 0;       //   which menu we are in, 0=none
 uint8_t bri_tft = 7;    //   0..7
@@ -89,22 +96,23 @@ uint8_t volume = 7;     //   0..7 -> 0..255 ()
 
 // esp now
 uint32_t peer_start = 0; //ms start time of peering 
-uint8_t peer_last = 0;  //ms last time
-uint8_t peer_found = 0; //   we found a second scale
-float avg_rec = 0;      //g  weight, received from other scale
-float stable_rec = 0;   //   ratio of stable time to STABLE_t_1, received
+uint32_t peer_last_s = 0;//ms last time greeting sent
+uint32_t peer_last_r = 0;//ms last time weight received
+uint8_t peer_found = 0;  //   we found a second scale
+float avg_rec = 0;       //g  weight, received from other scale
+float stable_rec = 0;    //   ratio of stable time to STABLE_t_1, received
 uint8_t greeting[]  = "Bier mit mir?!";
 uint8_t intro[]     = "BS1.0";
 uint8_t broadcast[] = {0xff, 0xff, 0xff, 0xff, 0xff, 0xff};
 
 // text
-#define TXT_L 10
+#define TXT_L 27 // (160 - (4*3*6 + 3*2*6 - 2 + 2*22)) / 2 = 6 + 21 = 27? 
 #define TXT_T 52
 uint16_t FG[5] = {ST77XX_BLACK, ST77XX_BLACK, ST77XX_WHITE, ST77XX_WHITE, ST77XX_BLACK};
 uint16_t BG[5] = {ST77XX_WHITE, ST77XX_GREEN, ST77XX_RED,   ST77XX_BLUE,  ST77XX_YELLOW};
 
 // tara sign
-#define TAR_L 159 - 6*3 - 4 //137 to 154
+#define TAR_L 159 - 6*3 + 1 - 4 // 4 px space
 #define TAR_T 52            
 
 // get stable value
@@ -212,7 +220,7 @@ void setup() {
   piezo.setOnToneCallback(onTone);
   piezo.setOnMuteCallback(onMute);
   piezo.setSong((uint8_t*)SONG_START, sizeof(SONG_START), 175);
-  piezo.play();
+  //piezo.play();
   leds.setLedColor(6, 0, 255, 0);
 
   // INIT DISPLAYS
@@ -247,7 +255,8 @@ void setup() {
 
   // INIT SCALE ADC, MEASURE INITIAL TARE
   scale.begin(SCALE_MISO, SCALE_CLK);
-  scale.set_scale(222.22); // //n:222.22 //b:220.56
+  scale.set_scale(220.56); //b --> todo menu
+  //scale.set_scale(222.22); //n
   tar = scale.get_units(10); // bad first value?
   avg = tar = scale.get_units(10);
 
@@ -303,7 +312,8 @@ void init_main() {
   tlast = millis();
 
   // draw fixed text
-  tft_print_all_it("    . g", TXT_L, TXT_T, 3);
+  //tft_print_all_it("    . g", TXT_L, TXT_T, 3);
+  //tft_print_all_it(". g", TXT_L+72, TXT_T+9, 2);
 
   tft_print_all(GINIT, 2, 18);
 
@@ -356,23 +366,16 @@ void loop() {
 
   // frame rate limiter, use sleep to save some battery if possible
   if(33 - min(33lu, millis() - tlast) > 0){
-    if(1)//!sleep_en)
+    if(sleep_lock)
       delay(33 - min(33lu, millis() - tlast));
     else{
       gpio_wakeup_enable(ROTARY_A, GPIO_INTR_HIGH_LEVEL);
       gpio_wakeup_enable(ROTARY_B, GPIO_INTR_HIGH_LEVEL);
       gpio_wakeup_enable(ROTARY_T, GPIO_INTR_HIGH_LEVEL);
       esp_sleep_enable_gpio_wakeup();
-      if(peer_found || peer_start){
-        esp_now_deinit();
-        WiFi.mode(WIFI_OFF);
-      }
       esp_sleep_enable_timer_wakeup(1000*(33-min(33lu, millis() - tlast)));
       //Serial.printf("dt2: %d\n", millis() - tlast);
       esp_light_sleep_start(); 
-      if(peer_found || peer_start) {
-        connect();
-      }
     }
   }
   uint32_t tnow = millis();
@@ -406,9 +409,6 @@ void measure(){
   float dnoise = 0.5;                     //g expected sample standard deviation in davg
   float alpha = 0.009 + 0.180 * ((fabs(davg)/dnoise))/((fabs(davg)/dnoise)+1);
   
-  //float delta = millis()-stable_ms;
-  //float alpha = 0.01 + 0.15 * max(0.0f, min(1.0f, (float)STABLE_t_0 * STABLE_t_0 / delta / delta ));
-  //if(fabs(avg) < 2) alpha = 0.04;
   avg_l = avg;
   avg = (1-alpha) * avg + alpha * val;
 
@@ -434,8 +434,7 @@ void measure(){
     }
   }
 
-  // reset stable time if value changed
-  // based on rate of change
+  // reset stable time if value changed, based on rate of change
   uint16_t sta = (uint16_t)floor(round(avg*10)/10);
   if((fabs(avg) < 10.0) || fabs(davg) > 0.5){
     stable_ms = millis();
@@ -450,11 +449,16 @@ void txt_draw(){
 
   disp_avg = avg;
   disp_stable = stable;
+#ifdef DEBUG
+  if(1){
+    if(millis() % 10000 > 5000){
+#else
   if(peer_found){
     if(avg_rec > 10.0 && disp_tar){
+#endif
       if(disp_remote != 1){
-        tft_print_all_it(" ", 4, TAR_T+8, 1);
-        tft_print_all_it("R", 4, TAR_T+16, 1);
+        tft_print_all_it("   ", 4, TAR_T+8, 1);
+        tft_print_all_it("REM", 4, TAR_T+16, 1);
         disp_remote = 1;
         for(uint8_t i=0; i<24; i++)
         leds.setLedColorData(i, BR8[bri_led] / 2, BR8[bri_led] / 2, 0); // yellow
@@ -467,29 +471,37 @@ void txt_draw(){
     }
     else{
       if(disp_remote != 0){
-        tft_print_all_it("L", 4, TAR_T+8, 1);
-        tft_print_all_it(" ", 4, TAR_T+16, 1);
+        tft_print_all_it("LOC", 4, TAR_T+8, 1);
+        tft_print_all_it("   ", 4, TAR_T+16, 1);
         disp_remote = 0;
         disp_tar = 0; //reprints TAR
       }
     }
   }
 
-  if(round(10*disp_avg) == round(10*disp_avg_l)) 
+  if((round(10*disp_avg) == round(10*disp_avg_l)) && (disp_remote && disp_shift == 0 || !disp_remote && disp_shift == 14)) 
     return;
 
   if(disp_avg <= -1000)
-    sprintf(txt, " low", disp_avg);
+    sprintf(txt, " low    low   ");
   else{
     if(disp_avg > 4000)
-      sprintf(txt, "high", disp_avg);
+      sprintf(txt, "high   high   ");
     else{
-        sprintf(txt, "%6.1f", disp_avg);
+      sprintf(txt, "%6.1fg%6.1fg", avg, avg_rec);
     }
   }
 
-  if(disp_stable < 1)
-    tft_print_all_it(txt, TXT_L, TXT_T, 3);
+  if(disp_stable < 1 || !(disp_shift == 14 || disp_shift == 0)){
+    if(disp_remote && disp_shift < 14) disp_shift++;
+    if(!disp_remote && disp_shift > 0) disp_shift--;
+    char* txts = &txt[disp_shift/2];
+    txts[7] = 0x00;
+    tft_print_all_it(&txts[4], TXT_L+71, TXT_T+6, 2);
+    txts[4] = 0x00;
+    tft_print_all_it(txts, TXT_L, TXT_T, 3);
+  }
+
   disp_avg_l = disp_avg;
 }
 
@@ -789,10 +801,11 @@ void tft_cs_all(uint8_t val){
 }
 
 // disable sleep on sound playback
-void onTone(uint16_t f){ sleep_en = 0; }
-void onMute(){ sleep_en = 1; }
+void onTone(uint16_t f){ sleep_lock |= 0x01; }
+void onMute(){ sleep_lock &= 0xfe; }
 
-// inputs, menu
+// inputs, menu functions ----------
+// read new rotary value, draw new menu
 void rotary_cb(long v) {
   #ifdef DEBUG
     Serial.printf("rotate: %i\n", v);
@@ -800,6 +813,7 @@ void rotary_cb(long v) {
   draw_menu(v, 0);
 }
 
+// read button and debounce, draw new menu on click
 void button_loop() {
   uint8_t btn = digitalRead(ROTARY_T);
   btn_hist = (btn_hist << 1) | btn;
@@ -813,7 +827,8 @@ void button_loop() {
 }
 
 void draw_menu(uint8_t v, uint8_t click){
-  if(click){ // button pressed, new menu
+  // button pressed, new menu, advance state machine
+  if(click){ 
     switch(menu){
       case 0:
         // 0 -> 1: initialize menu
@@ -878,38 +893,28 @@ void draw_menu(uint8_t v, uint8_t click){
     v = rotary.readEncoder();
   }
 
-  // encoder input
-  //if(menu == 0){
-  //  if(bri_led == bri_tft) // change both if same
-  //    bri_led = v;
-  //  bri_tft = v;
-  //  ledcWrite(TFT_BL[1], BR10[v]);
-  //  ledcWrite(TFT_BL[2], BR10[v]);
-  //  ledcWrite(TFT_BL[3], BR10[v]);
-  //  ledcWrite(TFT_BL[4], BR10[v]);
-  //}
-
-  if(menu == 12 || menu == 0){
+  // adjust settings to rotary value
+  if(menu == 12 || menu == 0){  // brightness LED
     bri_led = v;
     for(uint8_t i=0; i<24; i++)
       leds.setLedColorData(i, 0, BR8[bri_led], 0);
     leds.show();
   }
-  if(menu == 13){
+  if(menu == 13){               // brightness TFT
     bri_tft = v;
     ledcWrite(TFT_BL[1], BR10[v]);
     ledcWrite(TFT_BL[2], BR10[v]);
     ledcWrite(TFT_BL[3], BR10[v]);
     ledcWrite(TFT_BL[4], BR10[v]); 
   }
-  if(menu == 14){
+  if(menu == 14){               // volume PIEZO
     volume = v;
     piezo.setVolume((uint8_t)((v * 255ul) / 7)); 
     piezo.setSong((uint8_t*)SONG_FIX, sizeof(SONG_FIX), 169);
     piezo.play();
   }
 
-  // draw
+  // redraw menu screen
   if(menu == 1){
     for(uint8_t i=0; i<5; i++){
       if(i == v) 
@@ -936,14 +941,15 @@ void draw_menu(uint8_t v, uint8_t click){
 }
 
 
-// esp-net
+// esp-net functions ----------
 void data_recv(const uint8_t * mac, const uint8_t *incomingData, int len){
 
-  Serial.printf("received %d byte\n", len);
+  //Serial.printf("received %d byte\n", len);
   if(len == sizeof(intro)+sizeof(avg)+sizeof(stable_rec)){
     if(!strncmp((char*)intro, (char*)incomingData, sizeof(intro))){
       memcpy(&avg_rec, incomingData+sizeof(intro), sizeof(avg_rec));
       memcpy(&stable_rec, incomingData+sizeof(intro)+sizeof(avg_rec), sizeof(stable_rec));
+      peer_last_r = millis();
     }
     return;
   }
@@ -965,27 +971,32 @@ void send_weight(){
 }
 
 void send_greeting(){
-  //Serial.println("greet!!");
-  if(millis() - peer_last < 300)
+  // send every ~500ms
+  if(millis() - peer_last_s < 500) 
     return;
-  peer_last = millis();
+  peer_last_s = millis();
+  // reset received weight after timeout
+  if((millis() - peer_last_r) > 1000)
+    avg_rec = 0;
+  // greet
   esp_err_t result = esp_now_send(broadcast, greeting, sizeof(greeting));
+  // blink "CON" while not peered
   if(millis() / 500 % 2 || peer_found)
-    tft_print_all_it("C", 4, TAR_T, 1);
+    tft_print_all_it("CON", 4, TAR_T, 1);
   else
-    tft_print_all_it(" ", 4, TAR_T, 1);
+    tft_print_all_it("   ", 4, TAR_T, 1);
 }
 
 void connect() {
   if(peer_start == 0){
-    Serial.println("connect!!");
+    Serial.println("connecting...");
+    sleep_lock |= 0x02;           // disable sleep with wifi on
     peer_start = millis();
     peer_found = 0;
-    disp_remote = 2;
+    disp_remote = 0;
   }
 
   WiFi.mode(WIFI_STA);
-  //WiFi.disconnect();
   WiFi.STA.begin();
 
   esp_now_init();
@@ -1000,9 +1011,9 @@ void connect() {
 
 void disconnect(){
   Serial.println("disconnecting");
-  tft_print_all_it(" ", 4, TAR_T, 1);
+  tft_print_all_it("   ", 4, TAR_T, 1);
   peer_start = 0;
+  sleep_lock &= 0xfd;
   esp_now_deinit();
-  //WiFi.disconnect();
   WiFi.mode(WIFI_OFF);
 }

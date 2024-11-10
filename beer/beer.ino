@@ -16,7 +16,9 @@
 #include <esp_now.h>
 #include <WiFi.h>
 #include "beer_gfx.h"
-
+#include <NimBLEDevice.h>
+#include <NimBLEServer.h>
+#include <NimBLEUtils.h>
 //#define DEBUG
 
 // DISPLAY (Aliexpress 1.77" TFT)
@@ -176,6 +178,88 @@ const PROGMEM uint8_t SONG_420[]   = {
 };
 //RTTTL: x:b=50,o=5,d=32:p,g#,g#,g#,g#,16g#,g#,8g#,g#,g#,g#,16g,4f.,g#,g#,g#,a#,16a#,a#,a#,a#,a#,8a#,g,g,g,16f,4d#.,8a#,c6,c6,c6,16c6,16a#,16g#,16g#,g#,d#6,d#6,c6,d#6,4c#6,16f.6,f6,d#6,d#6,16c#6,16c.6,c6,c#6,c#6,16g#,16a#.,g#,a#,a#,g,16a#,8g#.,d#6,f6,16d#6,16c#6,c6,c6,16a#,
 
+// Add these global definitions
+#define SERVICE_UUID        "4fafc201-1fb5-459e-8fcc-c5c9c331914b"
+#define SCALE_CHAR_UUID    "beb5483e-36e1-4688-b7f5-ea07361b26a8"
+#define PLAYER_CHAR_UUID   "beb5483e-36e1-4688-b7f5-ea07361b26a9"
+#define MENU_BLE 15  // Next free menu index
+
+// Add these global variables
+bool ble_enabled = false;
+bool deviceConnected = false;
+NimBLEServer* pServer = nullptr;
+NimBLECharacteristic* pScaleCharacteristic = nullptr;
+NimBLECharacteristic* pPlayerCharacteristic = nullptr;
+
+class MyServerCallbacks: public NimBLEServerCallbacks {
+    void onConnect(NimBLEServer* pServer) override {
+        deviceConnected = true;
+    }
+
+    void onDisconnect(NimBLEServer* pServer) override {
+        deviceConnected = false;
+        if (pServer != nullptr) {
+            pServer->startAdvertising();
+        }
+    }
+};
+
+class MyPlayerCallbacks: public NimBLECharacteristicCallbacks {
+    void onWrite(NimBLECharacteristic *pCharacteristic) override {
+        std::string value = pCharacteristic->getValue();
+        if (value.length() > 0) {
+            // Process received data
+        }
+    }
+};
+
+void setupBLE() {
+    if (ble_enabled) return;
+
+    NimBLEDevice::init("BeerScale");
+    pServer = NimBLEDevice::createServer();
+    pServer->setCallbacks(new MyServerCallbacks());
+    
+    NimBLEService *pService = pServer->createService(SERVICE_UUID);
+    
+    pScaleCharacteristic = pService->createCharacteristic(
+        SCALE_CHAR_UUID,
+        NIMBLE_PROPERTY::NOTIFY
+    );
+    
+    pPlayerCharacteristic = pService->createCharacteristic(
+        PLAYER_CHAR_UUID,
+        NIMBLE_PROPERTY::WRITE
+    );
+    pPlayerCharacteristic->setCallbacks(new MyPlayerCallbacks());
+    
+    pService->start();
+    NimBLEDevice::startAdvertising();
+    
+    ble_enabled = true;
+}
+
+void stopBLE() {
+    if (!ble_enabled) return;
+    
+    if (pServer) {
+        NimBLEDevice::deinit();
+        pServer = nullptr;
+        pScaleCharacteristic = nullptr;
+        pPlayerCharacteristic = nullptr;
+    }
+    ble_enabled = false;
+    deviceConnected = false;
+}
+
+void sendWeightUpdate(float weight) {
+    if (ble_enabled && deviceConnected && pScaleCharacteristic) {
+        char weightStr[8];
+        sprintf(weightStr, "%.1f", weight);
+        pScaleCharacteristic->setValue(weightStr);
+        pScaleCharacteristic->notify();
+    }
+}
 // CODE
 void IRAM_ATTR readEncoderISR(){
     rotary.readEncoder_ISR();
@@ -338,7 +422,9 @@ void loop() {
     disconnect();
   if(peer_found && !disp_tar)
     send_weight();
-
+  if (ble_enabled && deviceConnected && disp_stable >= 1) {
+        sendWeightUpdate(avg);
+    }
   // draw main - menu only drawn on input
   if(menu == 0){
     // new text
@@ -823,7 +909,7 @@ void draw_menu(uint8_t v, uint8_t click){
         tft_print_all_it(" link...", 16, 10+16, 2);
         tft_print_all_it(" led bri.", 16, 10+32, 2);
         tft_print_all_it(" tft bri.", 16, 10+48, 2);
-        tft_print_all_it(" snd vol.", 16, 10+64, 2);
+        tft_print_all_it(" bluetooth", 16, 10+64, 2);;
         menu = 1;
         rotary.setBoundaries(0, 4, true);
         rotary.setEncoderValue(0);
@@ -852,12 +938,32 @@ void draw_menu(uint8_t v, uint8_t click){
           rotary.setBoundaries(0, 7, false);
           rotary.setEncoderValue(bri_tft);
         }
-        if(v == 4){
-          menu = 14;
-          tft_print_all_it("=", 10, 10+4*16, 2);
-          rotary.setBoundaries(0, 7, false);
-          rotary.setEncoderValue(volume);
-        }
+        if(v == 4) {  // BLE menu initial setup
+                    menu = MENU_BLE;
+                    for(uint8_t i=1; i<5; i++)
+                        tfts[i].fillScreen(BG[i]);
+                    tft_print_all_it(" back...", 16, 10, 2);
+                    tft_print_all_it(" Status: ", 16, 10+16, 2);
+                    tft_print_all_it(ble_enabled ? "ON" : "OFF", 110, 10+16, 2);  // Put ON/OFF next to Status
+
+                    if(ble_enabled) {
+                        String macAddress = BLEDevice::getAddress().toString().c_str();
+                        String macPart1 = macAddress.substring(0, 8);  // XX:XX:XX
+                        String macPart2 = macAddress.substring(9);     // XX:XX:XX
+                        tft_print_all_it(" MAC:", 16, 10+32, 2);
+                        tft_print_all_it(macPart1.c_str(), 16, 10+48, 2);
+                        tft_print_all_it(macPart2.c_str(), 16, 10+64, 2);
+
+                        if(deviceConnected) {
+                            tft_print_all_it(" Connected", 16, 10+110, 2);
+                        }
+                    }
+
+                    rotary.setBoundaries(0, 1, true);
+                    rotary.setEncoderValue(0);
+                    return;
+                }
+                    
         break;
       case 12:
         menu = 1;
@@ -874,6 +980,51 @@ void draw_menu(uint8_t v, uint8_t click){
         rotary.setEncoderValue(4);
         rotary.setBoundaries(0, 4, true);
         break;
+      case MENU_BLE:
+            if(v == 0) { // Back selected
+                menu = 1;
+                rotary.setBoundaries(0, 3, true);
+                rotary.setEncoderValue(3);
+
+                // Redraw main menu
+                for(uint8_t i=1; i<5; i++)
+                    tfts[i].fillScreen(BG[i]);
+                tft_print_all_it(" back...", 16, 10, 2);
+                tft_print_all_it(" link...", 16, 10+16, 2);
+                tft_print_all_it(" led bri.", 16, 10+32, 2);
+                tft_print_all_it(" tft bri.", 16, 10+48, 2);
+                tft_print_all_it(" bluetooth", 16, 10+64, 2);
+                return;
+            } else {
+                // Toggle BLE
+                if (!ble_enabled) {
+                    setupBLE();
+                    tft_print_all_it("   ", 110, 10+16, 2);     // Clear status
+                    tft_print_all_it("ON", 110, 10+16, 2);      // Show new status
+
+                    // Display split MAC address
+                    String macAddress = BLEDevice::getAddress().toString().c_str();
+                    String macPart1 = macAddress.substring(0, 8);
+                    String macPart2 = macAddress.substring(9);
+                    tft_print_all_it(" MAC:", 16, 10+32, 2);
+                    tft_print_all_it(macPart1.c_str(), 16, 10+48, 2);
+                    tft_print_all_it(macPart2.c_str(), 16, 10+64, 2);
+
+                    piezo.setSong((uint8_t*)SONG_FIX, sizeof(SONG_FIX), 169);
+                    piezo.play();
+                } else {
+                    stopBLE();
+                    tft_print_all_it("   ", 110, 10+16, 2);     // Clear status
+                    tft_print_all_it("OFF", 110, 10+16, 2);     // Show new status
+                    // Clear everything else
+                    tft_print_all_it("                    ", 16, 10+32, 2);  // Clear MAC label
+                    tft_print_all_it("                    ", 16, 10+48, 2);  // Clear MAC part 1
+                    tft_print_all_it("                    ", 16, 10+64, 2);  // Clear MAC part 2
+                    tft_print_all_it("                    ", 16, 10+110, 2);  // Clear Connected status
+                }
+            }
+            break;
+
     }
     v = rotary.readEncoder();
   }
@@ -902,13 +1053,18 @@ void draw_menu(uint8_t v, uint8_t click){
     ledcWrite(TFT_BL[3], BR10[v]);
     ledcWrite(TFT_BL[4], BR10[v]); 
   }
-  if(menu == 14){
-    volume = v;
-    piezo.setVolume((uint8_t)((v * 255ul) / 7)); 
-    piezo.setSong((uint8_t*)SONG_FIX, sizeof(SONG_FIX), 169);
-    piezo.play();
+  // Handle encoder input for different menus
+  if(menu == MENU_BLE) 
+  {
+    // Update cursor position
+    if(v == 0) {
+        tft_print_all_it(">", 10, 10, 2);
+        tft_print_all_it(" ", 10, 10+32, 2);
+    } else {
+        tft_print_all_it(" ", 10, 10, 2);
+        tft_print_all_it(">", 10, 10+32, 2);
+    }
   }
-
   // draw
   if(menu == 1){
     for(uint8_t i=0; i<5; i++){
@@ -927,11 +1083,6 @@ void draw_menu(uint8_t v, uint8_t click){
     char txt[2];
     sprintf(txt, "%d", bri_tft);
     tft_print_all_it(txt, 130, 58, 2);  
-  }
-  if(menu == 1 || menu == 14){
-    char txt[2];
-    sprintf(txt, "%d", volume);
-    tft_print_all_it(txt, 130, 74, 2);  
   }
 }
 
